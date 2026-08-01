@@ -1,8 +1,7 @@
 use std::io::Cursor;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use async_signal::{Signal, Signals};
 use futures_util::StreamExt;
@@ -19,30 +18,7 @@ use serde::Deserialize;
 struct ServerState {
     canvas: Arc<RwLock<RgbImage>>,
     canvas_size: (u32, u32),
-    canvas_cache: Arc<Mutex<Option<CanvasCache<Vec<u8>>>>>,
     queue: Arc<Sender<Pixel>>,
-}
-
-struct CanvasCache<T> {
-    data: T,
-    updated_at: Instant,
-}
-
-impl<T> CanvasCache<T> {
-    fn new(data: T) -> Self {
-        Self {
-            data,
-            updated_at: Instant::now(),
-        }
-    }
-
-    fn get(&self) -> Option<&T> {
-        if self.updated_at.elapsed() >= Duration::from_millis(100) {
-            return None;
-        }
-
-        Some(&self.data)
-    }
 }
 
 #[derive(Deserialize)]
@@ -57,17 +33,6 @@ struct Pixel {
 #[handler]
 #[expect(clippy::needless_pass_by_value)]
 fn get_image(state: Data<&ServerState>) -> Response {
-    if let Some(data) = state
-        .canvas_cache
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|cache| cache.get())
-    {
-        let data = data.clone();
-        return Response::from(data);
-    }
-
     let mut buffer = Cursor::new(Vec::new());
 
     state
@@ -77,10 +42,7 @@ fn get_image(state: Data<&ServerState>) -> Response {
         .write_to(&mut buffer, ImageFormat::Png)
         .unwrap();
 
-    let data = buffer.into_inner();
-    *state.canvas_cache.lock().unwrap() = Some(CanvasCache::new(data.clone()));
-
-    Response::from(data)
+    Response::from(buffer.into_inner())
         .set_content_type("image/png")
         .with_header("Cache-Control", "no-store")
         .into_response()
@@ -145,7 +107,6 @@ async fn main() {
                 let canvas = canvas.read().unwrap();
                 (canvas.width(), canvas.height())
             },
-            canvas_cache: Arc::default(),
             queue: Arc::new(tx),
         });
 
