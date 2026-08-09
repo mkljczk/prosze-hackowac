@@ -1,33 +1,79 @@
 use std::io::Cursor;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use async_signal::{Signal, Signals};
-use futures_util::StreamExt;
-use image::{ImageFormat, ImageReader, Rgb, RgbImage};
+use image::{ImageBuffer, ImageFormat, ImageReader, Rgb, RgbImage};
 use poem::endpoint::StaticFileEndpoint;
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::middleware::Tracing;
+use poem::web::sse::{Event, SSE};
 use poem::web::{Data, Json};
 use poem::{EndpointExt, IntoResponse, Response, Route, Server, handler};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct ServerState {
     canvas: Arc<RwLock<RgbImage>>,
     canvas_size: (u32, u32),
-    queue: Arc<Sender<Pixel>>,
+    queue: mpsc::Sender<Option<Pixel>>,
+    updated_pixels: broadcast::WeakSender<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Pixel {
     x: u32,
     y: u32,
     r: u8,
     g: u8,
     b: u8,
+}
+
+impl Pixel {
+    const fn color(&self) -> Rgb<u8> {
+        Rgb([self.r, self.g, self.b])
+    }
+}
+
+#[expect(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
+fn process_queue(
+    canvas: Arc<RwLock<RgbImage>>,
+    queue_rx: mpsc::Receiver<Option<Pixel>>,
+    updated_pixels_tx: broadcast::Sender<String>,
+) {
+    while let Ok(Some(mut pixel)) = queue_rx.recv() {
+        let mut canvas = canvas.write().unwrap();
+
+        loop {
+            let current_color = canvas.get_pixel_mut(pixel.x, pixel.y);
+            let new_color = pixel.color();
+
+            if *current_color != new_color {
+                *current_color = new_color;
+
+                updated_pixels_tx
+                    .send(serde_json::to_string(&pixel).unwrap())
+                    .ok();
+            }
+
+            let Ok(new_pixel) = queue_rx.try_recv() else {
+                break;
+            };
+
+            let Some(new_pixel) = new_pixel else {
+                return;
+            };
+
+            pixel = new_pixel;
+        }
+    }
 }
 
 #[handler]
@@ -50,6 +96,19 @@ fn get_image(state: Data<&ServerState>) -> Response {
 
 #[handler]
 #[expect(clippy::needless_pass_by_value)]
+fn get_updates(state: Data<&ServerState>) -> SSE {
+    let receiver = {
+        let sender = state.updated_pixels.upgrade().unwrap();
+        sender.subscribe()
+    };
+
+    let stream = BroadcastStream::new(receiver).map(|message| Event::message(message.unwrap()));
+
+    SSE::new(stream).keep_alive(CONNECTION_TIMEOUT)
+}
+
+#[handler]
+#[expect(clippy::needless_pass_by_value)]
 fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response {
     if json.x >= state.canvas_size.0 || json.y >= state.canvas_size.1 {
         return StatusCode::BAD_REQUEST
@@ -57,7 +116,7 @@ fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response {
             .into_response();
     }
 
-    state.queue.send(json).unwrap();
+    state.queue.send(Some(json)).unwrap();
 
     StatusCode::NO_CONTENT.into()
 }
@@ -67,38 +126,31 @@ async fn main() {
     tracing_subscriber::fmt().init();
 
     let canvas = {
-        let mut image_reader = ImageReader::open("data/image.png").unwrap();
-        image_reader.set_format(ImageFormat::Png);
-        let image = image_reader.decode().unwrap().into_rgb8();
+        let image = ImageReader::open("data/image.png").map_or_else(
+            |_| ImageBuffer::new(1920, 1080),
+            |mut image_reader| {
+                image_reader.set_format(ImageFormat::Png);
+                image_reader.decode().unwrap().into_rgb8()
+            },
+        );
+
         Arc::new(RwLock::new(image))
     };
 
-    let (tx, rx) = mpsc::channel::<Pixel>();
+    let (queue_tx, queue_rx) = mpsc::channel::<Option<Pixel>>();
+    let (updated_pixels_tx, _) = broadcast::channel::<String>(16);
+    let updated_pixels_weak = updated_pixels_tx.downgrade();
 
-    {
-        let canvas_clone = canvas.clone();
+    let handle = {
+        let canvas = canvas.clone();
 
-        #[expect(clippy::significant_drop_tightening)]
-        thread::spawn(move || {
-            while let Ok(mut pixel) = rx.recv() {
-                let mut canvas = canvas_clone.write().unwrap();
-
-                loop {
-                    canvas.put_pixel(pixel.x, pixel.y, Rgb([pixel.r, pixel.g, pixel.b]));
-
-                    let Ok(new_pixel) = rx.try_recv() else {
-                        break;
-                    };
-
-                    pixel = new_pixel;
-                }
-            }
-        });
-    }
+        thread::spawn(|| process_queue(canvas, queue_rx, updated_pixels_tx))
+    };
 
     let app = Route::new()
         .at("/", StaticFileEndpoint::new("static/index.html"))
         .at("/image", poem::get(get_image))
+        .at("/updates", poem::get(get_updates))
         .at("/pixel", poem::post(set_pixel))
         .with(Tracing)
         .data(ServerState {
@@ -107,20 +159,25 @@ async fn main() {
                 let canvas = canvas.read().unwrap();
                 (canvas.width(), canvas.height())
             },
-            queue: Arc::new(tx),
+            queue: queue_tx.clone(),
+            updated_pixels: updated_pixels_weak,
         });
 
     Server::new(TcpListener::bind("0.0.0.0:80"))
+        .idle_timeout(CONNECTION_TIMEOUT)
         .run_with_graceful_shutdown(
             app,
             async {
                 let mut signals = Signals::new([Signal::Term, Signal::Int]).unwrap();
                 signals.next().await.unwrap().unwrap();
+                queue_tx.send(None).unwrap();
             },
-            None,
+            Some(CONNECTION_TIMEOUT),
         )
         .await
         .unwrap();
+
+    handle.join().unwrap();
 
     canvas
         .read()
