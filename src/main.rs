@@ -1,51 +1,23 @@
-use std::io::Cursor;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use async_signal::{Signal, Signals};
 use clap::Parser;
-use image::{ImageBuffer, ImageFormat, ImageReader, Rgb, RgbImage};
+use image::{ImageBuffer, ImageFormat, ImageReader, RgbImage};
 use poem::endpoint::StaticFileEndpoint;
-use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::middleware::Tracing;
-use poem::web::sse::{Event, SSE};
-use poem::web::{Data, Json};
-use poem::{EndpointExt, IntoResponse, Response, Route, Server, handler};
-use serde::{Deserialize, Serialize};
+use poem::{EndpointExt, Route, Server};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 
-use crate::cli::Cli;
+use crate::models::{Cli, Pixel, ServerState};
 
-mod cli;
+mod endpoints;
+mod models;
 
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Clone)]
-struct ServerState {
-    canvas: Arc<RwLock<RgbImage>>,
-    canvas_size: (u32, u32),
-    queue: mpsc::Sender<Option<Pixel>>,
-    updated_pixels: broadcast::WeakSender<String>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-struct Pixel {
-    x: u32,
-    y: u32,
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl Pixel {
-    const fn color(&self) -> Rgb<u8> {
-        Rgb([self.r, self.g, self.b])
-    }
-}
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[expect(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
 fn process_queue(
@@ -81,51 +53,6 @@ fn process_queue(
     }
 }
 
-#[handler]
-#[expect(clippy::needless_pass_by_value)]
-fn get_image(state: Data<&ServerState>) -> Response {
-    let mut buffer = Cursor::new(Vec::new());
-
-    state
-        .canvas
-        .read()
-        .unwrap()
-        .write_to(&mut buffer, ImageFormat::Png)
-        .unwrap();
-
-    Response::from(buffer.into_inner())
-        .set_content_type("image/png")
-        .with_header("Cache-Control", "no-store")
-        .into_response()
-}
-
-#[handler]
-#[expect(clippy::needless_pass_by_value)]
-fn get_updates(state: Data<&ServerState>) -> SSE {
-    let receiver = {
-        let sender = state.updated_pixels.upgrade().unwrap();
-        sender.subscribe()
-    };
-
-    let stream = BroadcastStream::new(receiver).map(|message| Event::message(message.unwrap()));
-
-    SSE::new(stream).keep_alive(CONNECTION_TIMEOUT)
-}
-
-#[handler]
-#[expect(clippy::needless_pass_by_value)]
-fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response {
-    if json.x >= state.canvas_size.0 || json.y >= state.canvas_size.1 {
-        return StatusCode::BAD_REQUEST
-            .with_body("pixel outside of drawing area")
-            .into_response();
-    }
-
-    state.queue.send(Some(json)).unwrap();
-
-    StatusCode::NO_CONTENT.into()
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
@@ -155,9 +82,9 @@ async fn main() {
 
     let app = Route::new()
         .at("/", StaticFileEndpoint::new("static/index.html"))
-        .at("/image", poem::get(get_image))
-        .at("/updates", poem::get(get_updates))
-        .at("/pixel", poem::post(set_pixel))
+        .at("/image", poem::get(endpoints::get_image))
+        .at("/updates", poem::get(endpoints::get_updates))
+        .at("/pixel", poem::post(endpoints::set_pixel))
         .with(Tracing)
         .data(ServerState {
             canvas: canvas.clone(),
