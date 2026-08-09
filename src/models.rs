@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock, mpsc};
 
 use clap::Parser;
@@ -35,5 +36,28 @@ pub struct Pixel {
 impl Pixel {
     pub const fn color(&self) -> Rgb<u8> {
         Rgb([self.r, self.g, self.b])
+    }
+}
+
+#[derive(Default)]
+pub struct UpdatesBatch {
+    pixels: HashMap<(u32, u32), Rgb<u8>>,
+}
+
+impl UpdatesBatch {
+    pub fn add(&mut self, pixel: Pixel) {
+        self.pixels.insert((pixel.x, pixel.y), pixel.color());
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.pixels
+            .into_iter()
+            .flat_map(|(position, Rgb(color))| {
+                <[_; _]>::from(position)
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .chain(color.into_iter().flat_map(u8::to_le_bytes))
+            })
+            .collect()
     }
 }

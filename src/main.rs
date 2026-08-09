@@ -1,8 +1,10 @@
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_signal::{Signal, Signals};
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD_NO_PAD;
 use clap::Parser;
 use image::{ImageBuffer, ImageFormat, ImageReader, RgbImage};
 use poem::endpoint::StaticFileEndpoint;
@@ -12,7 +14,7 @@ use poem::{EndpointExt, Route, Server};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
-use crate::models::{Cli, Pixel, ServerState};
+use crate::models::{Cli, Pixel, ServerState, UpdatesBatch};
 
 mod endpoints;
 mod models;
@@ -26,6 +28,8 @@ fn process_queue(
     updated_pixels_tx: broadcast::Sender<String>,
 ) {
     while let Ok(Some(mut pixel)) = queue_rx.recv() {
+        let batch_start = Instant::now();
+        let mut updates_batch = UpdatesBatch::default();
         let mut canvas = canvas.write().unwrap();
 
         loop {
@@ -34,13 +38,12 @@ fn process_queue(
 
             if *current_color != new_color {
                 *current_color = new_color;
-
-                updated_pixels_tx
-                    .send(serde_json::to_string(&pixel).unwrap())
-                    .ok();
+                updates_batch.add(pixel);
             }
 
-            let Ok(new_pixel) = queue_rx.try_recv() else {
+            let Ok(new_pixel) = queue_rx
+                .recv_timeout(Duration::from_millis(100).saturating_sub(batch_start.elapsed()))
+            else {
                 break;
             };
 
@@ -50,6 +53,10 @@ fn process_queue(
 
             pixel = new_pixel;
         }
+
+        updated_pixels_tx
+            .send(BASE64_STANDARD_NO_PAD.encode(updates_batch.into_bytes()))
+            .ok();
     }
 }
 
