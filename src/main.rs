@@ -4,6 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use async_signal::{Signal, Signals};
+use clap::Parser;
 use image::{ImageBuffer, ImageFormat, ImageReader, Rgb, RgbImage};
 use poem::endpoint::StaticFileEndpoint;
 use poem::http::StatusCode;
@@ -16,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+
+use crate::cli::Cli;
+
+mod cli;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -124,6 +129,7 @@ fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
+    let args = Cli::parse();
 
     let canvas = {
         let image = ImageReader::open("data/image.png").map_or_else(
@@ -163,7 +169,7 @@ async fn main() {
             updated_pixels: updated_pixels_weak,
         });
 
-    Server::new(TcpListener::bind("0.0.0.0:80"))
+    Server::new(TcpListener::bind((args.host, args.port)))
         .idle_timeout(CONNECTION_TIMEOUT)
         .run_with_graceful_shutdown(
             app,
