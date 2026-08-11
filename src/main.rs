@@ -1,6 +1,5 @@
-use std::sync::{Arc, RwLock, mpsc};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_signal::{Signal, Signals};
 use base64::Engine;
@@ -11,52 +10,71 @@ use poem::endpoint::StaticFileEndpoint;
 use poem::listener::TcpListener;
 use poem::middleware::Tracing;
 use poem::{EndpointExt, Route, Server};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::{self, Instant};
 use tokio_stream::StreamExt;
 
 use crate::models::{Cli, Pixel, ServerState, UpdatesBatch};
 
 mod endpoints;
 mod models;
+mod network;
 
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[expect(clippy::needless_pass_by_value, clippy::significant_drop_tightening)]
-fn process_queue(
+#[expect(clippy::significant_drop_tightening)]
+async fn process_queue(
     canvas: Arc<RwLock<RgbImage>>,
-    queue_rx: mpsc::Receiver<Option<Pixel>>,
+    mut stop_rx: watch::Receiver<()>,
+    mut queue_rx: mpsc::UnboundedReceiver<Pixel>,
     updated_pixels_tx: broadcast::Sender<String>,
 ) {
-    while let Ok(Some(mut pixel)) = queue_rx.recv() {
-        let batch_start = Instant::now();
+    while let Some(mut pixel) = tokio::select! {
+        biased;
+        pixel = queue_rx.recv() => pixel,
+        _ = stop_rx.changed() => None,
+    } {
+        let batch_end = Instant::now() + Duration::from_millis(100);
         let mut updates_batch = UpdatesBatch::default();
-        let mut canvas = canvas.write().unwrap();
 
         loop {
-            let current_color = canvas.get_pixel_mut(pixel.x, pixel.y);
-            let new_color = pixel.color();
+            {
+                let mut canvas = canvas.write().unwrap();
 
-            if *current_color != new_color {
-                *current_color = new_color;
-                updates_batch.add(pixel);
+                loop {
+                    let current_color = canvas.get_pixel_mut(pixel.x, pixel.y);
+                    let new_color = pixel.color();
+
+                    if *current_color != new_color {
+                        *current_color = new_color;
+                        updates_batch.add(pixel);
+                    }
+
+                    let Ok(new_pixel) = queue_rx.try_recv() else {
+                        break;
+                    };
+
+                    pixel = new_pixel;
+                }
             }
 
-            let Ok(new_pixel) = queue_rx
-                .recv_timeout(Duration::from_millis(100).saturating_sub(batch_start.elapsed()))
-            else {
+            let Some(new_pixel) = (tokio::select! {
+                biased;
+                pixel = queue_rx.recv() => pixel,
+                () = time::sleep_until(batch_end) => None,
+                _ = stop_rx.changed() => return,
+            }) else {
                 break;
-            };
-
-            let Some(new_pixel) = new_pixel else {
-                return;
             };
 
             pixel = new_pixel;
         }
 
-        updated_pixels_tx
-            .send(BASE64_STANDARD_NO_PAD.encode(updates_batch.into_bytes()))
-            .ok();
+        if !updates_batch.is_empty() {
+            updated_pixels_tx
+                .send(BASE64_STANDARD_NO_PAD.encode(updates_batch.into_bytes()))
+                .ok();
+        }
     }
 }
 
@@ -77,14 +95,42 @@ async fn main() {
         Arc::new(RwLock::new(image))
     };
 
-    let (queue_tx, queue_rx) = mpsc::channel::<Option<Pixel>>();
+    let canvas_size = {
+        let canvas = canvas.read().unwrap();
+        (canvas.width(), canvas.height())
+    };
+
+    let (stop_tx, stop_rx) = watch::channel(());
+    let (queue_tx, queue_rx) = mpsc::unbounded_channel::<Pixel>();
     let (updated_pixels_tx, _) = broadcast::channel::<String>(16);
     let updated_pixels_weak = updated_pixels_tx.downgrade();
 
-    let handle = {
+    let process_queue_handle = {
         let canvas = canvas.clone();
+        let stop_rx = stop_rx.clone();
+        tokio::spawn(process_queue(canvas, stop_rx, queue_rx, updated_pixels_tx))
+    };
 
-        thread::spawn(|| process_queue(canvas, queue_rx, updated_pixels_tx))
+    let tcp_listener_handle = {
+        let host = args.host.clone();
+
+        tokio::spawn(network::tcp_listener(
+            (host, args.tcp_port),
+            canvas_size,
+            stop_rx.clone(),
+            queue_tx.clone(),
+        ))
+    };
+
+    let udp_listener_handle = {
+        let host = args.host.clone();
+
+        tokio::spawn(network::udp_listener(
+            (host, args.udp_port),
+            canvas_size,
+            stop_rx.clone(),
+            queue_tx.clone(),
+        ))
     };
 
     let app = Route::new()
@@ -95,29 +141,28 @@ async fn main() {
         .with(Tracing)
         .data(ServerState {
             canvas: canvas.clone(),
-            canvas_size: {
-                let canvas = canvas.read().unwrap();
-                (canvas.width(), canvas.height())
-            },
+            canvas_size,
             queue: queue_tx.clone(),
             updated_pixels: updated_pixels_weak,
         });
 
-    Server::new(TcpListener::bind((args.host, args.port)))
+    Server::new(TcpListener::bind((args.host, args.http_port)))
         .idle_timeout(CONNECTION_TIMEOUT)
         .run_with_graceful_shutdown(
             app,
             async {
                 let mut signals = Signals::new([Signal::Term, Signal::Int]).unwrap();
                 signals.next().await.unwrap().unwrap();
-                queue_tx.send(None).unwrap();
+                stop_tx.send(()).unwrap();
             },
             Some(CONNECTION_TIMEOUT),
         )
         .await
         .unwrap();
 
-    handle.join().unwrap();
+    tcp_listener_handle.await.unwrap();
+    udp_listener_handle.await.unwrap();
+    process_queue_handle.await.unwrap();
 
     canvas
         .read()

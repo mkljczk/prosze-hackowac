@@ -47,7 +47,9 @@ pub fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response
             .into_response();
     }
 
-    state.queue.send(Some(json)).unwrap();
-
-    StatusCode::NO_CONTENT.into()
+    match state.queue.send(json) {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+    .into()
 }
