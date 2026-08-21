@@ -1,85 +1,154 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="pl">
-  <head>
-    <title>proszę hackować</title>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width" />
+    <head>
+        <title>proszę hackować</title>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width" />
 
-    <style>
-      :root {
-        --gray-90: hsl(0, 0%, 90%);
-        --gray-75: hsl(0, 0%, 75%);
-        --gray-50: hsl(0, 0%, 50%);
-        --gray-20: hsl(0, 0%, 20%);
-        --gray-15: hsl(0, 0%, 15%);
-        --gray-10: hsl(0, 0%, 10%);
+        <style>
+            :root {
+                --gray-90: hsl(0, 0%, 90%);
+                --gray-75: hsl(0, 0%, 75%);
+                --gray-50: hsl(0, 0%, 50%);
+                --gray-20: hsl(0, 0%, 20%);
+                --gray-15: hsl(0, 0%, 15%);
+                --gray-10: hsl(0, 0%, 10%);
 
-        background: var(--gray-15);
-        color: var(--gray-90);
-        text-align: center;
-        font-family: sans-serif;
-      }
+                background: var(--gray-15);
+                color: var(--gray-90);
+                text-align: center;
+                font-family: sans-serif;
+            }
 
-      @media (prefers-color-scheme: light) {
-        :root {
-          --gray-90: hsl(0, 0%, 10%);
-          --gray-75: hsl(0, 0%, 25%);
-          --gray-20: hsl(0, 0%, 80%);
-          --gray-15: hsl(0, 0%, 85%);
-          --gray-10: hsl(0, 0%, 90%);
-        }
-      }
+            @media (prefers-color-scheme: light) {
+                :root {
+                    --gray-90: hsl(0, 0%, 10%);
+                    --gray-75: hsl(0, 0%, 25%);
+                    --gray-20: hsl(0, 0%, 80%);
+                    --gray-15: hsl(0, 0%, 85%);
+                    --gray-10: hsl(0, 0%, 90%);
+                }
+            }
 
-      code {
-        display: block;
-        font-size: 1.5em;
-      }
+            code {
+                display: block;
+                font-size: 1.5em;
+            }
 
-      img {
-        display: block;
-        max-width: 80%;
-        margin-inline: auto;
-      }
+            canvas {
+                display: block;
+                max-width: 80%;
+                margin-inline: auto;
+            }
 
-      a {
-        color: unset;
-      }
-    </style>
-  </head>
+            a {
+                color: unset;
+            }
 
-  <body>
-    <main>
-      <h1>dzień dobry</h1>
-      <h2 id="subtitle">proszę hackować</h2>
-      <code>
-        curl -X POST cebula.jel.gay/pixel -H "Content-Type: application/json"
-        --data '{"x": u32, "y": u32, "r": u8, "g": u8, "b": u8}'
-      </code>
-      rozmiar: 1920×1080
-      <img id="image" src="/image" alt="Obecny stan" />
-      <a href="https://github.com/jelni/prosze-hackowac">GitHub</a>
-    </main>
-  </body>
+            #content {
+                margin-block: 1em;
+            }
+        </style>
+    </head>
+
+    <body>
+        <main>
+            <h1>dzień dobry</h1>
+            <h2 id="subtitle">proszę hackować</h2>
+
+            <code>
+                curl -X POST cebula.jel.gay/pixel -H "Content-Type:
+                application/json" --data '{"x": u32, "y": u32, "r": u8, "g": u8,
+                "b": u8}'
+            </code>
+
+            rozmiar: 1920×1080
+
+            <div id="content">subskrybowanie strumienia zmian…</div>
+            <a href="https://github.com/jelni/prosze-hackowac">GitHub</a>
+        </main>
+    </body>
 </html>
 
 <script>
-  const image = document.getElementById("image");
-  const subtitle = document.getElementById("subtitle");
+    const subtitle = document.getElementById("subtitle");
+    const content = document.getElementById("content");
+    let context;
+    let imageData;
+    let queuedUpdates;
 
-  if (Math.random() < 0.01) {
-    subtitle.textContent = "hacked by hackerspace żyrardów";
-  }
+    function loadImage() {
+        queuedUpdates = [];
+        imageData = undefined;
+        content.replaceChildren("pobieranie obecnego stanu…");
+        const image = new Image();
 
-  function updateImage() {
-    const url = new URL(image.src);
-    url.searchParams.set("cache", new Date().getTime());
-    image.src = url;
-  }
+        image.addEventListener("load", () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = image.width;
+            canvas.height = image.height;
+            context = canvas.getContext("2d");
+            context.drawImage(image, 0, 0);
 
-  function scheduleUpdateImage() {
-    setTimeout(updateImage, 100);
-  }
+            const localImageData = context.getImageData(
+                0,
+                0,
+                canvas.width,
+                canvas.height,
+            );
 
-  image.addEventListener("load", scheduleUpdateImage);
-  image.addEventListener("error", scheduleUpdateImage);
+            for (const update of queuedUpdates) {
+                applyUpdate(localImageData, update);
+            }
+
+            queuedUpdates = undefined;
+            context.putImageData(localImageData, 0, 0);
+            imageData = localImageData;
+            content.replaceChildren(canvas);
+        });
+
+        image.src = `image?${encodeURIComponent(Date.now())}`;
+    }
+
+    function applyUpdate(imageData, update) {
+        const view = new DataView(Uint8Array.fromBase64(update).buffer);
+
+        for (let offset = 0; offset < view.byteLength; offset += 11) {
+            const x = view.getUint32(offset, false);
+            const y = view.getUint32(offset + 4, false);
+
+            if (x >= imageData.width || y >= imageData.height) {
+                continue;
+            }
+
+            const r = view.getUint8(offset + 8);
+            const g = view.getUint8(offset + 9);
+            const b = view.getUint8(offset + 10);
+
+            const index = (y * imageData.width + x) * 4;
+            imageData.data[index] = r;
+            imageData.data[index + 1] = g;
+            imageData.data[index + 2] = b;
+        }
+    }
+
+    if (Math.random() < 0.01) {
+        subtitle.textContent = "hacked by hackerspace żyrardów";
+    }
+
+    const updates = new EventSource("updates");
+    updates.addEventListener("open", loadImage);
+
+    updates.addEventListener("error", () =>
+        content.replaceChildren("rozłączono…"),
+    );
+
+    updates.addEventListener("message", (event) => {
+        if (imageData) {
+            applyUpdate(imageData, event.data);
+            context.putImageData(imageData, 0, 0);
+        } else {
+            queuedUpdates.push(event.data);
+        }
+    });
 </script>
