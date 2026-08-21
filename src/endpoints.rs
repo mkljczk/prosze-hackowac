@@ -14,14 +14,9 @@ use crate::models::{Pixel, ServerState};
 #[poem::handler]
 #[expect(clippy::needless_pass_by_value)]
 pub fn get_image(state: Data<&ServerState>) -> Response {
+    let canvas = state.canvas.read().unwrap().clone();
     let mut buffer = Cursor::new(Vec::new());
-
-    state
-        .canvas
-        .read()
-        .unwrap()
-        .write_to(&mut buffer, ImageFormat::Png)
-        .unwrap();
+    canvas.write_to(&mut buffer, ImageFormat::Png).unwrap();
 
     Response::from(buffer.into_inner())
         .set_content_type("image/png")
