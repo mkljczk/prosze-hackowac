@@ -28,7 +28,8 @@ pub fn get_image(state: Data<&ServerState>) -> Response {
 #[expect(clippy::needless_pass_by_value)]
 pub fn get_updates(state: Data<&ServerState>) -> SSE {
     let receiver = state.updated_pixels.upgrade().unwrap().subscribe();
-    let stream = BroadcastStream::new(receiver).map(|message| Event::message(message.unwrap()));
+    let stream = BroadcastStream::new(receiver)
+        .map_while(|message| message.map_or(None, |message| Some(Event::message(message))));
 
     SSE::new(stream).keep_alive(CONNECTION_TIMEOUT)
 }
@@ -43,7 +44,7 @@ pub fn set_pixel(state: Data<&ServerState>, Json(json): Json<Pixel>) -> Response
     }
 
     match state.queue.send(json) {
-        Ok(_) => StatusCode::NO_CONTENT,
+        Ok(()) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
     .into()
