@@ -50,16 +50,13 @@
             }
 
             main:has(#full-size:checked) #content {
-                overflow: auto;
-
                 canvas {
-                    max-width: unset;
+                    position: absolute;
+                    left: 0;
+                    top: 0;
                     min-width: 100%;
+                    max-width: unset;
                 }
-            }
-
-            label {
-                display: block;
             }
         </style>
     </head>
@@ -78,11 +75,10 @@
             rozmiar: 1920×1080
 
             <label>
-                <input type="checkbox" id="full-size">
-                pełny rozmiar podglądu
+                <div id="content">subskrybowanie strumienia zmian…</div>
+                <input hidden id="full-size" type="checkbox" />
             </label>
 
-            <div id="content">subskrybowanie strumienia zmian…</div>
             <a href="https://github.com/jelni/prosze-hackowac">GitHub</a>
         </main>
     </body>
